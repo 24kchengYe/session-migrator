@@ -35,11 +35,14 @@ Ask the user if not clear:
 
 Session files are at: `~/.claude/projects/<sanitized-path>/`
 
-The sanitized path replaces path separators with `--` and removes drive colons. Examples:
+Claude's sanitization rule: `:` becomes `--`, then all `/`, `\`, `_`, spaces, and other non-alphanumeric characters become a single `-`. Examples:
 - `C:\Users\ASUS` → `C--Users-ASUS`
 - `D:\pythonPycharms\Zync` → `D--pythonPycharms-Zync`
+- `G:\Research_20250121\24AI for urban scientist` → `G--Research-20250121-24AI-for-urban-scientist`
 
-**CRITICAL: Do NOT try to compute the sanitized path manually (especially with Chinese/Unicode paths).** Instead, directly search the existing directories:
+Note: underscores `_` and spaces become `-`, NOT `--`. Only `:` becomes `--`.
+
+**CRITICAL: Do NOT try to compute the sanitized path manually.** The safest approach is to first `cd` into the target directory and launch `claude` once (then exit). This forces Claude to create the correct sanitized directory. Then find it:
 
 ```bash
 # Find source project dir by partial match
@@ -49,7 +52,7 @@ ls -d ~/.claude/projects/*keyword* 2>/dev/null
 ls -d ~/.claude/projects/*057* 2>/dev/null
 ```
 
-For the **target** sanitized path, check if it already exists:
+For the **target** sanitized path, first launch claude in the target dir to let it create the correct directory, then find it:
 ```bash
 ls -d ~/.claude/projects/*keyword* 2>/dev/null
 ```
