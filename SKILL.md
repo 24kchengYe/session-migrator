@@ -68,7 +68,7 @@ ls -lt ~/.claude/projects/<source-sanitized>/*.jsonl | head -10
 
 By default, migrate the **most recent** session. If user asks for a specific one, let them choose.
 
-### Step 4: Copy and rewrite (MUST use Python binary mode)
+### Step 4: Copy and rewrite (MUST use Python binary mode + external script)
 
 ```bash
 # Create target directory
@@ -79,39 +79,160 @@ cp ~/.claude/projects/<source-sanitized>/<session-id>.jsonl \
    ~/.claude/projects/<target-sanitized>/<session-id>.jsonl
 ```
 
-**CRITICAL: Do NOT use `sed` for path replacement.** JSONL files contain JSON-escaped paths with double backslashes, and non-ASCII characters (Chinese, etc.) are stored as raw UTF-8 bytes. `sed` will fail silently or corrupt the file. **Always use a Python script with binary mode (`'rb'`/`'wb'`):**
+**CRITICAL: Do NOT use `sed` for path replacement.** JSONL files contain JSON-escaped paths with double backslashes, and non-ASCII characters (Chinese, etc.) are stored as raw UTF-8 bytes. `sed` will fail silently or corrupt the file.
 
-```python
-import sys, re
+#### The backslash escape hell problem
+
+In JSON files, Windows path `G:\Research` is stored as `G:\\Research` — that's two literal bytes `5c 5c` in the file. When you try to construct replacement paths in Python:
+
+- `b'G:\\\\Research'` in Python bytes literal = `G:\\Research` = bytes `47 3a 5c 5c 52...` ✅ CORRECT
+- `'G:\\\\Research'.encode('utf-8')` in Python str = `G:\\Research` = bytes `47 3a 5c 5c 52...` ✅ CORRECT
+- `'G:\\Research'.encode('utf-8')` in Python str = `G:\Research` = bytes `47 3a 5c 52...` ❌ WRONG (single backslash, breaks JSON)
+- Inline `-c "..."` with shell: extra layer of escaping makes it nearly impossible to get right
+
+**The ONLY reliable approach: write to an external .py file with `cat << 'PYEOF'` (single-quoted heredoc prevents shell expansion), and construct paths using `bytes.fromhex()` for backslashes.**
+
+#### Recommended approach: extract-and-replace
+
+Instead of manually constructing the full new path (error-prone), **extract the old cwd from the file, then modify it** (e.g., trim a suffix or replace a substring):
+
+```bash
+cat > /tmp/migrate_session.py << 'PYEOF'
+import re, json, sys
+
+session_file = sys.argv[1]
+# old_suffix and new_suffix as hex-safe bytes (see below)
+
+with open(session_file, 'rb') as f:
+    content = f.read()
+
+pattern = rb'"cwd":"([^"]*)"'
+cwds = set(re.findall(pattern, content))
+
+# Step 1: Print what we found (for debugging)
+sys.stdout.reconfigure(encoding='utf-8')
+print("Found cwd paths:")
+for c in cwds:
+    print(f"  hex: {c.hex(' ')}")
+    print(f"  str: {c.decode('utf-8')}")
+
+# Step 2: Build the suffix/substring to replace using bytes.fromhex()
+# NEVER use Python string escapes for backslashes!
+#
+# To build a path segment like \\投稿\\building simulation:
+#   - \\ in file = 5c5c (two bytes)
+#   - 投稿 in UTF-8 = e68a95 e7a8bf
+#   - Use: bytes.fromhex('5c5c') + bytes.fromhex('e68a95e7a8bf') + bytes.fromhex('5c5c') + b'building simulation'
+#
+# Or for pure ASCII paths like \\subfolder:
+#   - bytes.fromhex('5c5c') + b'subfolder'
+
+old_suffix = bytes.fromhex('5c5c') + '投稿'.encode('utf-8') + bytes.fromhex('5c5c') + b'building simulation'
+
+for old_cwd in sorted(cwds, key=len, reverse=True):
+    if old_cwd.endswith(old_suffix):
+        new_cwd = old_cwd[:-len(old_suffix)]
+        content = content.replace(
+            b'"cwd":"' + old_cwd + b'"',
+            b'"cwd":"' + new_cwd + b'"'
+        )
+        print(f"Replaced -> {new_cwd.decode('utf-8')}")
+
+with open(session_file, 'wb') as f:
+    f.write(content)
+
+# Step 3: Verify JSON integrity
+with open(session_file, 'rb') as f:
+    lines = f.readlines()
+errors = 0
+for line in lines:
+    if not line.strip():
+        continue
+    try:
+        json.loads(line)
+    except:
+        errors += 1
+print(f"JSON parse errors: {errors} / {len(lines)}")
+
+# Step 4: Verify new cwd
+with open(session_file, 'rb') as f:
+    new_cwds = set(re.findall(pattern, f.read()))
+for c in new_cwds:
+    print(f"Final cwd: {c.decode('utf-8')}")
+PYEOF
+
+python /tmp/migrate_session.py "<target-session-file>"
+```
+
+#### Alternative: full path replacement
+
+If source and target paths share no common prefix, replace the entire cwd value:
+
+```bash
+cat > /tmp/migrate_session.py << 'PYEOF'
+import re, json, sys
+sys.stdout.reconfigure(encoding='utf-8')
 
 session_file = sys.argv[1]
 
 with open(session_file, 'rb') as f:
     content = f.read()
 
-# Find all unique cwd values (as raw bytes)
 pattern = rb'"cwd":"([^"]*)"'
 cwds = set(re.findall(pattern, content))
 
-# New path must be JSON-escaped (use \\\\ for each backslash)
-new_path = b'G:\\\\Research_20250121\\\\24AI for urban scientist'
+# Build new path using bytes.fromhex for backslashes + .encode('utf-8') for text
+# Example: D:\\pythonPycharms\\新项目
+# CRITICAL: use bytes.fromhex('5c5c') for each \\ separator, NOT b'\\\\'
+new_path = (
+    b'D:' + bytes.fromhex('5c5c') +
+    b'pythonPycharms' + bytes.fromhex('5c5c') +
+    '新项目'.encode('utf-8')
+)
 
-# Replace longest paths first to avoid partial matches
 for old in sorted(cwds, key=len, reverse=True):
-    old_full = b'"cwd":"' + old + b'"'
-    new_full = b'"cwd":"' + new_path + b'"'
-    content = content.replace(old_full, new_full)
+    content = content.replace(
+        b'"cwd":"' + old + b'"',
+        b'"cwd":"' + new_path + b'"'
+    )
 
 with open(session_file, 'wb') as f:
     f.write(content)
+
+# Verify (same as above)
+with open(session_file, 'rb') as f:
+    vf = f.read()
+errors = sum(1 for line in vf.split(b'\n') if line.strip() and _safe_json(line))
+new_cwds = set(re.findall(pattern, vf))
+for c in new_cwds:
+    print(f"Final cwd: {c.decode('utf-8')}")
+
+def _safe_json(line):
+    try:
+        json.loads(line)
+        return False
+    except:
+        return True
+PYEOF
 ```
 
-**Why binary mode is required:**
-- JSON files on Windows store paths like `D:\\pythonPycharms\\工具开发\\057邮件处理`
-- The `\\` are literal two-character sequences in the file (backslash + backslash)
-- Chinese characters are raw UTF-8 bytes (e.g., `工` = `\xe5\xb7\xa5`)
-- Python text mode + string escaping = double-encoding chaos
-- Binary mode (`rb`/`wb`) avoids all encoding issues by treating the file as raw bytes
+#### Key rules for path byte construction
+
+| What you want in the file | How to build it in Python |
+|---|---|
+| `\\` (JSON-escaped backslash, bytes `5c 5c`) | `bytes.fromhex('5c5c')` |
+| ASCII text like `Research` | `b'Research'` |
+| Chinese text like `投稿` | `'投稿'.encode('utf-8')` |
+| Full path `G:\\Research\\投稿` | `b'G:' + bytes.fromhex('5c5c') + b'Research' + bytes.fromhex('5c5c') + '投稿'.encode('utf-8')` |
+
+**NEVER use Python string escapes (`\\\\`, `b'\\\\'`) for backslashes in path construction.** The number of escape layers (shell → Python string → bytes → JSON) makes it nearly impossible to get right. `bytes.fromhex('5c5c')` is unambiguous.
+
+#### Mandatory verification
+
+After rewriting, ALWAYS verify:
+1. **JSON integrity**: parse every line with `json.loads()`, report error count (must be 0)
+2. **cwd correctness**: extract and print all cwd values, confirm they match the target path
+3. If JSON errors > 0, the file is corrupted — re-copy from source and retry
 
 ### Step 5: Copy memory files (optional)
 
